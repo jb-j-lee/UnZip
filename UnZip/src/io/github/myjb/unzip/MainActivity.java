@@ -1,4 +1,6 @@
-package com.example.unzip;
+package io.github.myjb.unzip;
+
+import io.github.myjb.unzip.R;
 
 import android.app.Activity;
 import android.os.Bundle;
