@@ -25,6 +25,9 @@ import java.io.InputStream;
 
 
 /**
+ * Traditional PKWARE Encryption
+ * https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+ * 
  * Input stream converting a password-protected zip to an unprotected zip.
  *
  * <h3>Example usage:</h3>
@@ -63,14 +66,20 @@ public class ZipDecryptInputStream extends InputStream {
     private int compressedSize;
     private int crc;
 
+    private int fileNameLenth;
+    private int[] fileName;
+    private int extraFieldLenth;
+    private byte[] rawName;
+
     /**
      * Creates a new instance of the stream.
      *
      * @param stream Input stream serving the password-protected zip file to be decrypted.
      * @param password Password to be used to decrypt the password-protected zip file.
      */
-    public ZipDecryptInputStream(InputStream stream, String password) {
+    public ZipDecryptInputStream(InputStream stream, String password, byte[] rawName) {
         this(stream, password.toCharArray());
+        this.rawName = rawName;
     }
 
     /**
@@ -105,6 +114,10 @@ public class ZipDecryptInputStream extends InputStream {
                         state = State.FLAGS;
                     }
                     break;
+//                case VERSION:
+//                    skipBytes = 1;
+//                    state = State.FLAGS;
+//                    break;
                 case FLAGS:
                     isEncrypted = (result & 1) != 0;
                     if ((result & 64) == 64) {
@@ -112,25 +125,51 @@ public class ZipDecryptInputStream extends InputStream {
                     }
                     if ((result & 8) == 8) {
                         compressedSize = -1;
-                        state = State.FN_LENGTH;
+                        state = State.FILE_NAME_LENGTH;
                         skipBytes = 19;
                     } else {
-                        state = State.CRC;
-                        skipBytes = 10;
+                    	if (isEncrypted) {
+                    		state = State.CRC;
+                    		skipBytes = 7;
+                    	} else {
+                    		state = State.COMPRESSION_METHOD;
+                    		skipBytes = 1;
+                    	}
                     }
                     if (isEncrypted) {
                         result -= 1;
                     }
                     break;
+                case COMPRESSION_METHOD:
+                    skipBytes = 5;
+                    state = State.CRC;
+                    break;
                 case CRC:
-                    crc = result;
+                    int[] values = new int[4];
+                    peekAhead(values);
+                    crc = 0;
+                    int valueInc = isEncrypted ? ZipUtil.DECRYPT_HEADER_SIZE : 0;
+                    for (int i = 0; i < 4; i++) {
+                    	crc += values[i] << (8 * i);
+                    	values[i] -= valueInc;
+                    	if(values[i] < 0) {
+                    		valueInc = 1;
+                    		values[i] += 256;
+                    	} else {
+                    		valueInc = 0;
+                    	}
+                    }
+                    overrideBuffer(values);
+                    result = values[0];
+                    crc = values[3];
+                    skipBytes = 3;
                     state = State.COMPRESSED_SIZE;
                     break;
                 case COMPRESSED_SIZE:
-                    int[] values = new int[4];
+                    values = new int[4];
                     peekAhead(values);
                     compressedSize = 0;
-                    int valueInc = isEncrypted ? ZipUtil.DECRYPT_HEADER_SIZE : 0;
+                    valueInc = isEncrypted ? ZipUtil.DECRYPT_HEADER_SIZE : 0;
                     for (int i = 0; i < 4; i++) {
                         compressedSize += values[i] << (8 * i);
                         values[i] -= valueInc;
@@ -146,51 +185,113 @@ public class ZipDecryptInputStream extends InputStream {
                     if (section == Section.DATA_DESCRIPTOR) {
                         state = State.SIGNATURE;
                     } else {
-                        state = State.FN_LENGTH;
+                        state = State.FILE_NAME_LENGTH;
                     }
                     skipBytes = 7;
                     break;
-                case FN_LENGTH:
-                    values = new int[4];
+                case FILE_NAME_LENGTH:
+                    values = new int[2];
                     peekAhead(values);
-                    skipBytes = 3 + values[0] + values[2] + (values[1] + values[3]) * 256;
+                    fileNameLenth = values[0] + values[1] * 256;
+                    fileName = new int[fileNameLenth];
+                    skipBytes = 1;
+                    state = State.EXTRA_FIELD_LENGTH;
+                    break;
+                case EXTRA_FIELD_LENGTH:
+                    values = new int[2];
+                    peekAhead(values);
+                    extraFieldLenth = values[0] + values[1] * 256;
                     if (!isEncrypted) {
                         if (compressedSize > 0) {
-                            throw new IllegalStateException("ZIP not password protected.");
+                        	state = State.HEADER;
+//                        	throw new IllegalStateException("ZIP not password protected.");
                         }
-                        state = State.SIGNATURE;
+                        else
+                        	state = State.SIGNATURE;
+                        skipBytes = 1 + fileNameLenth + extraFieldLenth;
                     } else {
-                        state = State.HEADER;
+                        state = State.FILE_NAME;
+                        skipBytes = 1;
+                    }
+                    break;
+                case FILE_NAME:
+                    values = new int[BUF_SIZE];
+                    peekAhead(values);
+                    int fileNameOffset = 0;
+                    int remain = 0;
+                    if (fileNameLenth <= BUF_SIZE) {
+                    	for (int i = 0; i < fileNameLenth; i++)
+                    		fileName[fileNameOffset++] = values[i];
+                    } else {
+                    	for (int i = 0; i < BUF_SIZE; i++) {
+                    		fileName[fileNameOffset++] = values[i];
+                    		remain = i;
+                    		if (fileNameOffset == fileNameLenth)
+                    			break;
+                    	}
+                    }
+
+                    if (fileNameLenth <= BUF_SIZE) {
+                    	state = State.HEADER;
+                    	skipBytes = (fileNameLenth - 1) + extraFieldLenth;
+                    } else if (fileNameOffset == fileNameLenth) {
+                    	state = State.HEADER;
+                    	skipBytes = remain + extraFieldLenth;
+                    } else {
+                    	state = State.FILE_NAME;
+                    	skipBytes = BUF_SIZE - 1;
                     }
                     break;
                 case HEADER:
                     section = Section.FILE_DATA;
-                    initKeys();
-                    byte lastValue = 0;
-                    for (int i = 0; i < ZipUtil.DECRYPT_HEADER_SIZE; i++) {
-                        lastValue = (byte) (result ^ decryptByte());
-                        updateKeys(lastValue);
-                        result = delegateRead();
+                    if (isEncrypted) {
+                    	initKeys();
+                    	byte lastValue = 0;
+                    	for (int i = 0; i < ZipUtil.DECRYPT_HEADER_SIZE; i++) {
+                            lastValue = (byte) (result ^ decryptByte());
+                            updateKeys(lastValue);
+                            result = delegateRead();
+                        }
+
+                    	if ((lastValue & 0xff) != crc) {
+                    		if (fileNameLenth == rawName.length) {
+                    			boolean checksum = true;
+                    			for (int i = 0; i < fileNameLenth; i++) {
+                    				if( (byte)fileName[i] != rawName[i]) {
+                    					checksum = false;
+                    					break;
+                    				}
+                    			}
+                    			
+                    			if (checksum)
+                    				throw new IllegalStateException("Wrong password!");
+                    		}
+                    	}
+                    	compressedSize -= ZipUtil.DECRYPT_HEADER_SIZE;
                     }
-                    if ((lastValue & 0xff) != crc) {
-//                        throw new IllegalStateException("Wrong password!");
-                    }
-                    compressedSize -= ZipUtil.DECRYPT_HEADER_SIZE;
+                    
                     state = State.DATA;
                     // intentionally no break
                 case DATA:
-                    if (compressedSize == -1 && peekAheadEquals(ZipUtil.DD_SIGNATURE)) {
-                        section = Section.DATA_DESCRIPTOR;
-                        skipBytes = 5;
-                        state = State.CRC;
-                    } else {
-                        result = (result ^ decryptByte()) & 0xff;
-                        updateKeys((byte) result);
-                        compressedSize--;
-                        if (compressedSize == 0) {
-                            state = State.SIGNATURE;
-                        }
-                    }
+                	if (isEncrypted) {
+                		if (compressedSize == -1 && peekAheadEquals(ZipUtil.DD_SIGNATURE)) {
+                			section = Section.DATA_DESCRIPTOR;
+                			skipBytes = 2;
+                			state = State.CRC;
+                		} else {
+                			result = (result ^ decryptByte()) & 0xff;
+                			updateKeys((byte) result);
+                			compressedSize--;
+                			if (compressedSize == 0) {
+                				state = State.SIGNATURE;
+                			}
+                		}
+                	} else {
+                		compressedSize--;
+                		if (compressedSize == 0) {
+                			state = State.SIGNATURE;
+                		}
+                	}
                     break;
                 case TAIL:
                     // do nothing
