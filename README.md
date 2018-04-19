@@ -1,4 +1,4 @@
-# UnZip
+# Unzip Util using Traditional PKWARE Encryption
 
 IDE Setting : Eclipse version
 
